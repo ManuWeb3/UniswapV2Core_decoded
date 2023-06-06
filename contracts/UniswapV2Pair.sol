@@ -32,6 +32,7 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
     uint public price1CumulativeLast;   // comments @ end
     // used to calc. Avg. Exchange Rate over a period of time. 
     uint public kLast; 
+    // 'k' is constant in Physics :)
     // reserve0 * reserve1, as of immediately after the most recent liquidity event (all 3: add, remove, swap)
     // The Constant Product Formulae => x*y = k (kLast)
 
@@ -54,6 +55,7 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
     // assigned 3 state vars to 3 local vars
     // current state of the exchange
     function getReserves() public view returns (uint112 _reserve0, uint112 _reserve1, uint32 _blockTimestampLast) {
+        // all 3 "good old friends in same slot" get updated in _update()
         _reserve0 = reserve0;
         _reserve1 = reserve1;
         _blockTimestampLast = blockTimestampLast;
@@ -105,9 +107,10 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
         token1 = _token1;
     }
     
+    // # 4:
     // _update() runs many times, hence gas op. technique to couple all 3 params together in 1 storage cell
     // update reserves and, on the first call per block, price accumulators
-    // This function is called every time tokens are deposited or withdrawn.
+    // This function is called EVERYTIME tokens are deposited or withdrawn or swapped/traded/exchanged
     function _update(uint balance0, uint balance1, uint112 _reserve0, uint112 _reserve1) private {
         require(balance0 <= uint112(-1) && balance1 <= uint112(-1), 'UniswapV2: OVERFLOW');
         // uint112(-1) = =2^112-1 (max value of uint112 = odd = all 1s in 112 bits)
@@ -125,40 +128,87 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
              * as blockTimestampLast is getting updated in last of `_update` function
             */
             // * never overflows, and + overflow is desired
+            
+            // AMM = Constant Product Formulae : Value0 = Value1 => 
+            // Price0 * Reserve0 = Price1 * Reserve1 => 
+            // price0 = (R1 / R0) * P1
+            // priceCumu2 = priceCumu1 + (price2 * timeElapsed2) (consider price0 like price2)
+
             price0CumulativeLast += uint(UQ112x112.encode(_reserve1).uqdiv(_reserve0)) * timeElapsed;
             price1CumulativeLast += uint(UQ112x112.encode(_reserve0).uqdiv(_reserve1)) * timeElapsed;
+            // `price0CumulativeLast` is accumulating price of assets so later we can calculate the price of a asset
+            // using the formulae @ the link - Uiswap v2 Oracle docs
+            
+            // we're using "priceCumu" above to calulate TWAP across a time interval
         }
-        
+        // good old 3 friends in the same storage slot
+        // This price calculation is the reason we need to know the old reserve sizes.
         reserve0 = uint112(balance0);
         reserve1 = uint112(balance1);
         blockTimestampLast = blockTimestamp;
+        // finally, emit
         emit Sync(reserve0, reserve1);
     }
 
-    // if (Protocol) fee is on, mint liquidity equivalent to 1/6th of the growth in sqrt(k) - later
+    // if (Protocol) fee is on, mint liquidity (tokens) equivalent to...
+    // 1/6th (0.05% (which pays Uniswap for their development effort) out of 0.3% trader fee) of the growth in sqrt(k) 
+    // bcz rest of the 0.25% of the fee goes to the LProviders only
+
+    // To reduce calculations (and therefore gas costs), 
+    // this fee is ONLY (NOT at every txn (not at swaps bcz it has complex calc.) calculated when liquidity is added or removed from the pool, 
+    // rather than at each transaction.
     function _mintFee(uint112 _reserve0, uint112 _reserve1) private returns (bool feeOn) {
         address feeTo = IUniswapV2Factory(factory).feeTo();
+        // feeOn true if NOT address(0) else false
         feeOn = feeTo != address(0);
+
         uint _kLast = kLast; // gas savings
+        // kLast (The Constant Product) is state var. saved it to memory-based iternal _kLast
+        // The liquidity providers get their cut simply by the appreciation of their liquidity tokens. 
+        // But the protocol fee requires new liquidity tokens to be minted and provided to the feeTo address.
+        // Once for LProviders for every deposition of Liquidity to the Pool BUT
+        // everytime for the Protocol as their dev-effort-Contracts are being used everytime a txn happens
         if (feeOn) {
             if (_kLast != 0) {
+                // which situation will make kLast = 0. YTFO
                 uint rootK = Math.sqrt(uint(_reserve0).mul(_reserve1));
+                // rootK ----------> this is root of current constant (_r0, _r1)
                 uint rootKLast = Math.sqrt(_kLast);
+                // rootKLast -------> this is root of previous contant (constant = reserve0 * reserve1)
+
+                // Liquidity minted for the 1st time when LProvider adds to the Pool:
+                // Sqrt(reserve0 * reserve1) (reserve0 * reserve1 = Constant Product = kLast)
+                // kLast = reserv0 * reserve1 => _updates at every txn (addL, removeL, swap)
+                // whereas _mintFee(_r0, _r1) gets clacl. only at addL and removeL
+                // so, the 2 products viz. -kLast (it's actually kLast only) can be diff. from (_reserve0*_reserve1)
+                // YTFO whether it's fully correct
+                
+                // # 5: (complete details at pg#24 of my personal notes)
                 if (rootK > rootKLast) {
                     uint numerator = totalSupply.mul(rootK.sub(rootKLast));
                     uint denominator = rootK.mul(5).add(rootKLast);
                     uint liquidity = numerator / denominator;
+
                     if (liquidity > 0) _mint(feeTo, liquidity);
                 }
             }
         } else if (_kLast != 0) {
             kLast = 0;
+            // If there is no fee set kLast to zero
         }
     }
 
-    // Externally Accessible Functions
-    // this low-level function should be called from a contract (Periphery) which performs important safety checks
+    // 3 (main) + 2(extra)  = 5 Externally Accessible Functions:
+    // # 6
+    // this low-level function should be called from a contract (Periphery, external to the this contract) which performs important safety checks
     function mint(address to) external lock returns (uint liquidity) {
+        /* steps -
+         * 1. liquidity provider uses router contract to deposit liquidity
+         * 2. Router contract sends assets of liquidity provider to this address
+         * 3. Then we calculate liquidity tokens to be minted
+         * 4. And mint liquidity tokens for liquidity provider
+         * 5. Update the reserves with `_update` function
+         */
         (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // gas savings
         uint balance0 = IERC20(token0).balanceOf(address(this));
         uint balance1 = IERC20(token1).balanceOf(address(this));
@@ -298,4 +348,50 @@ the value of 2**32 is 4294967296
 `4294967296 - 1` is allowed but if we use 4294967296 or greater, the value will be reset (try it yourself on browser console)
 that's why they are modding it by 2**32, so if the value is greater than this, it gets reset.
 Note: Always double check what I am writing. This is what I can understand
+*/
+
+/* # 4
+https://docs.uniswap.org/contracts/v2/concepts/core-concepts/oracles
+Uniswapv2 as the Price Oracle:
+Every pair measures (but does not store) the market price at the beginning of each block, before any trades take place. 
+This price is expensive to manipulate because it is set by the last transaction, 
+whether it is a mint, swap, or burn, in a previous block
+==========================
+Uniswap is also a price oracle
+* It is a Time Weighted Average Price Oracle (TWAP).
+* Uniswap calculates the price everytime a swap happens
+* it calculates average price of security over a specified amount of time
+* it is using price0CumulativeLast for calculating price 
+* `price0CumulativeLast` is accumulating price of assets so later we can calculate the price of a asset
+* UQ112x112 library is for encoding floating point numbers as solidity only support intergers
+* `UQ112x112.encode(_reserve1)` is encoding so floating point numbers don't cause any problem
+* `(UQ112x112.encode(_reserve1).uqdiv(_reserve0)` is dividing it by reserve of another token coz it's how a AMM works.
+* multiplying `timeElapsed` as it is needed for mathematical formula
+* Please look at this for clear understanding https://docs.uniswap.org/protocol/V2/concepts/core-concepts/oracles (must read)
+* with `price0CumulativeLast` & timeStamp we can calculate average price across any time interval.
+*/
+
+/* # 5
+2.4 Protocol fee: (Whitepaper)
+Uniswap v2 includes a 0.05% protocol fee that can be turned on and off. If turned on,
+this fee would be sent to a feeTo address specified in the factory contract.
+Initially, feeTo is not set, and no fee is collected. A pre-specified address—feeToSetter—can
+call the setFeeTo function on the Uniswap v2 factory contract, setting feeTo to a different
+value. feeToSetter can also call the setFeeToSetter to change the feeToSetter address itself.
+If the feeTo address is set, the protocol will begin charging a 5-basis-point fee, which is
+taken as a 1/6 cut of the 30-basis-point fees earned by liquidity providers. That is, traders will
+continue to pay a 0.30% fee on all trades; 83.3% of that fee (0.25% of the amount traded)
+will go to liquidity providers, and 16.6% of that fee (0.05% of the amount traded) will go to
+the feeTo address.
+Collecting this 0.05% fee at the time of the trade would impose an additional gas cost on
+every trade. To avoid this, accumulated fees are collected only when liquidity is deposited
+or withdrawn. The contract computes the accumulated fees, and mints new liquidity tokens
+to the fee beneficiary, immediately before any tokens are minted or burned.
+*/
+
+/* # 6:
+Note that while any transaction or contract can call these functions, 
+they are designed to be called from the periphery contract. 
+If you call them directly you won't be able to cheat the pair exchange, 
+but you might lose value through a mistake.
 */
