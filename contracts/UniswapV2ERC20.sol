@@ -1,3 +1,5 @@
+// UNI - liquidity token by the name of "UNI-V2"
+
 pragma solidity =0.5.16;
 
 import './interfaces/IUniswapV2ERC20.sol';

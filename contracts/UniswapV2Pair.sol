@@ -14,6 +14,7 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
     using UQ112x112 for uint224;    // handles representation of floating points like 1.0, 1.5
     
     // 1000 - to avoid division by zero errors
+    // sent to address(0) in the first mint()
     uint public constant MINIMUM_LIQUIDITY = 10**3;
     bytes4 private constant SELECTOR = bytes4(keccak256(bytes('transfer(address,uint256)')));
     
@@ -111,6 +112,7 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
     // _update() runs many times, hence gas op. technique to couple all 3 params together in 1 storage cell
     // update reserves and, on the first call per block, price accumulators
     // This function is called EVERYTIME tokens are deposited or withdrawn or swapped/traded/exchanged
+    // _r0 and _r1 and resp. balances are the same, just that reserves
     function _update(uint balance0, uint balance1, uint112 _reserve0, uint112 _reserve1) private {
         require(balance0 <= uint112(-1) && balance1 <= uint112(-1), 'UniswapV2: OVERFLOW');
         // uint112(-1) = =2^112-1 (max value of uint112 = odd = all 1s in 112 bits)
@@ -184,7 +186,10 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
                 // YTFO whether it's fully correct
                 
                 // # 5: (complete details at pg#24 of my personal notes)
+                // older _r0 and _r1 (not updated yet with new balances) values passed into _mintFee() =>
+                // we have to compare the both
                 if (rootK > rootKLast) {
+                    // "totalSupply" read from the storage
                     uint numerator = totalSupply.mul(rootK.sub(rootKLast));
                     uint denominator = rootK.mul(5).add(rootKLast);
                     uint liquidity = numerator / denominator;
@@ -201,6 +206,7 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
     // 3 (main) + 2(extra)  = 5 Externally Accessible Functions:
     // # 6
     // this low-level function should be called from a contract (Periphery, external to the this contract) which performs important safety checks
+    // called from a periphery contract that calls it after adding the liquidity in the same transaction
     function mint(address to) external lock returns (uint liquidity) {
         /* steps -
          * 1. liquidity provider uses router contract to deposit liquidity
@@ -209,37 +215,68 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
          * 4. And mint liquidity tokens for liquidity provider
          * 5. Update the reserves with `_update` function
          */
-        (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // gas savings
+        // get reserves (updated due to _update())
+        (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // gas savings (usually returns 3 good old friends, blockTimestamp)
+        // get balances
         uint balance0 = IERC20(token0).balanceOf(address(this));
         uint balance1 = IERC20(token1).balanceOf(address(this));
+        // _r0 and_r1 get updated with every txn on Uniswap
+        // retrieve final balances and subtract prev. reserves to... 
+        // get the new amounts added for both the ERC20 tokens
+        // bcz balances get updated first @ token.transferFrom() while adding both ERC20 tokens
         uint amount0 = balance0.sub(_reserve0);
         uint amount1 = balance1.sub(_reserve1);
-
+        // check whether Protocol Fee is turned on
+        // if on, then _mint() liquidity tokens to feeTo address obtained from the Factory, if it's set (conditional)
         bool feeOn = _mintFee(_reserve0, _reserve1);
-        uint _totalSupply = totalSupply; // gas savings, must be defined here since totalSupply can update in _mintFee
-        if (_totalSupply == 0) {
-            liquidity = Math.sqrt(amount0.mul(amount1)).sub(MINIMUM_LIQUIDITY);
+        // Because the parameters to _mintFee are the old reserve values, 
+        // the fee is calculated accurately based only on pool changes due to fees (see _mintFee())
+        uint _totalSupply = totalSupply; // gas savings (reading from memory, not storage now), 
+        // must be defined here since totalSupply can update in _mintFee - YTFO
+        if (_totalSupply == 0) {    // first ever deposit of LP tokens => Liquidity thus far is = 0
+            // QTY.(first tie liquidity tokens (UNI-v2)) = sqrt(reserves0 * reserves1 = Constant Product)
+            liquidity = Math.sqrt(amount0.mul(amount1)).sub(MINIMUM_LIQUIDITY); // M-L = 1000, divide by zero - avoid
+            // send MINIMUM_LIQUIDITY to address zero to lock them
+            // send "liquidity" to the legitimate owner who dep. the orig. LP's tokens
+            // whether the first amountS deposited are of equal value is checked by the user itself to avoid losing value to arbitrage
+            // so, Uniswap's code is not checking it and wasting its own resources
+
+            // Now, total supply has been increased to MINIMUM_LIQUIDITY (1000) from 0 so we can prevent division by zero
            _mint(address(0), MINIMUM_LIQUIDITY); // permanently lock the first MINIMUM_LIQUIDITY tokens
+           // 10^(-)15 of a single full UNI-v2 liquidity token, LESS value, so not big loss if permanently locked
         } else {
+            // for subsequent liquidity, Golden Ratio comes into picture
+            // LProvider should deposit equal value of the tokens
+            // if less, then minimum of the 2 CD-token calculated (basis Golden ratio) will be minted to the LProvider as a punishment
             liquidity = Math.min(amount0.mul(_totalSupply) / _reserve0, amount1.mul(_totalSupply) / _reserve1);
+            // _reserve0` ----------> total reserves (balance of a asset WITHOUT including amount which is being deposited)
         }
+        // the balance "liquidity" value must be > 0 after sub. MINIMUM_LIQUIDITY = 1000
         require(liquidity > 0, 'UniswapV2: INSUFFICIENT_LIQUIDITY_MINTED');
         _mint(to, liquidity);
-
+        // after every txn, _upadte() to update the reserves (and block.timestamp) 
+        // with the latest balance positions of both the token in the pair
         _update(balance0, balance1, _reserve0, _reserve1);
-        if (feeOn) kLast = uint(reserve0).mul(reserve1); // reserve0 and reserve1 are up-to-date
+        // if feeOn = false, then kLast = 0
+        if (feeOn) kLast = uint(reserve0).mul(reserve1); 
+        // reserve0 and reserve1 are up-to-date after _update() above => kLast is also up-to-date now 
+        // finally...
         emit Mint(msg.sender, amount0, amount1);
     }
 
     // this low-level function should be called from a contract (Periphery) which performs important safety checks
+    // address to = address of V2Pair
     function burn(address to) external lock returns (uint amount0, uint amount1) {
-        (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // gas savings
-        address _token0 = token0;                                // gas savings
-        address _token1 = token1;                                // gas savings
+        (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // gas savings (used internal/local/memory vars)
+        address _token0 = token0;                                // gas savings (used internal/local/memory vars)
+        address _token1 = token1;                                // gas savings (used internal/local/memory vars)
+        // get balances of liquidity-pool-tokens (Pair)
         uint balance0 = IERC20(_token0).balanceOf(address(this));
         uint balance1 = IERC20(_token1).balanceOf(address(this));
+        // IMP. - get balance of liquidity-tokens (UNI-v2), already transferred to this contract by the Periphery 
+        // before calling burn() on this contract
         uint liquidity = balanceOf[address(this)];
-
+        
         bool feeOn = _mintFee(_reserve0, _reserve1);
         uint _totalSupply = totalSupply; // gas savings, must be defined here since totalSupply can update in _mintFee
         amount0 = liquidity.mul(balance0) / _totalSupply; // using balances ensures pro-rata distribution
