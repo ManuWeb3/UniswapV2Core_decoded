@@ -113,6 +113,7 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
     }
 
     // # 3
+    // 0,1 (and not A,B) bcz it's sorted by Factory.sol already
     // called once by the factory at time of deployment
     // can be called externally ONLY by the Factory after deployment (using CREATE2)
     // specifies which 2 tokens can be exchanged by this deployed LPool
